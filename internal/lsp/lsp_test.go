@@ -50,23 +50,13 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 
 	cache := cache.New()
 	session := cache.NewSession(ctx)
-	options := session.Options()
-	options.SupportedCodeActions = map[source.FileKind]map[protocol.CodeActionKind]bool{
-		source.Go: {
-			protocol.SourceOrganizeImports: true,
-			protocol.QuickFix:              true,
-		},
-		source.Mod: {},
-		source.Sum: {},
-	}
-	options.HoverKind = source.SynopsisDocumentation
+	options := tests.DefaultOptions()
 	session.SetOptions(options)
 	options.Env = data.Config.Env
 	session.NewView(ctx, viewName, span.FileURI(data.Config.Dir), options)
 	for filename, content := range data.Config.Overlay {
-		session.SetOverlay(span.FileURI(filename), content)
+		session.SetOverlay(span.FileURI(filename), source.DetectLanguage("", filename), content)
 	}
-
 	r := &runner{
 		server: &Server{
 			session:     session,
@@ -91,7 +81,7 @@ func (r *runner) Diagnostics(t *testing.T, data tests.Diagnostics) {
 		if !ok {
 			t.Fatalf("%s is not a Go file: %v", uri, err)
 		}
-		results, err := source.Diagnostics(r.ctx, v, gof, nil)
+		results, _, err := source.Diagnostics(r.ctx, v, gof, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,210 +97,6 @@ func (r *runner) Diagnostics(t *testing.T, data tests.Diagnostics) {
 			t.Error(diff)
 		}
 	}
-}
-
-func (r *runner) Completion(t *testing.T, data tests.Completions, snippets tests.CompletionSnippets, items tests.CompletionItems) {
-	for src, test := range data {
-		view := r.server.session.ViewOf(src.URI())
-		original := view.Options()
-		modified := original
-
-		// Set this as a default.
-		modified.Completion.Documentation = true
-
-		var want []source.CompletionItem
-		for _, pos := range test.CompletionItems {
-			want = append(want, *items[pos])
-		}
-
-		modified.Completion.Deep = strings.Contains(string(src.URI()), "deepcomplete")
-		modified.Completion.FuzzyMatching = strings.Contains(string(src.URI()), "fuzzymatch")
-		modified.Completion.Unimported = strings.Contains(string(src.URI()), "unimported")
-		view.SetOptions(modified)
-
-		list := r.runCompletion(t, src)
-
-		wantBuiltins := strings.Contains(string(src.URI()), "builtins")
-		var got []protocol.CompletionItem
-		for _, item := range list.Items {
-			if !wantBuiltins && isBuiltin(item) {
-				continue
-			}
-			got = append(got, item)
-		}
-
-		switch test.Type {
-		case tests.CompletionFull:
-			if diff := diffCompletionItems(want, got); diff != "" {
-				t.Errorf("%s: %s", src, diff)
-			}
-		case tests.CompletionPartial:
-			if msg := checkCompletionOrder(want, got); msg != "" {
-				t.Errorf("%s: %s", src, msg)
-			}
-		}
-		view.SetOptions(original)
-	}
-
-	for _, usePlaceholders := range []bool{true, false} {
-
-		for src, want := range snippets {
-			view := r.server.session.ViewOf(src.URI())
-			original := view.Options()
-			modified := original
-
-			modified.InsertTextFormat = protocol.SnippetTextFormat
-			modified.Completion.Deep = strings.Contains(string(src.URI()), "deepcomplete")
-			modified.Completion.FuzzyMatching = strings.Contains(string(src.URI()), "fuzzymatch")
-			modified.Completion.Unimported = strings.Contains(string(src.URI()), "unimported")
-			modified.Completion.Placeholders = usePlaceholders
-			view.SetOptions(modified)
-
-			list := r.runCompletion(t, src)
-
-			wantItem := items[want.CompletionItem]
-			var got *protocol.CompletionItem
-			for _, item := range list.Items {
-				if item.Label == wantItem.Label {
-					got = &item
-					break
-				}
-			}
-			if got == nil {
-				t.Fatalf("%s: couldn't find completion matching %q", src.URI(), wantItem.Label)
-			}
-			var expected string
-			if usePlaceholders {
-				expected = want.PlaceholderSnippet
-			} else {
-				expected = want.PlainSnippet
-			}
-			if expected != got.TextEdit.NewText {
-				t.Errorf("%s: expected snippet %q, got %q", src, expected, got.TextEdit.NewText)
-			}
-			view.SetOptions(original)
-		}
-	}
-}
-
-func (r *runner) runCompletion(t *testing.T, src span.Span) *protocol.CompletionList {
-	t.Helper()
-	list, err := r.server.Completion(r.ctx, &protocol.CompletionParams{
-		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
-			TextDocument: protocol.TextDocumentIdentifier{
-				URI: protocol.NewURI(src.URI()),
-			},
-			Position: protocol.Position{
-				Line:      float64(src.Start().Line() - 1),
-				Character: float64(src.Start().Column() - 1),
-			},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return list
-}
-
-func isBuiltin(item protocol.CompletionItem) bool {
-	// If a type has no detail, it is a builtin type.
-	if item.Detail == "" && item.Kind == protocol.TypeParameterCompletion {
-		return true
-	}
-	// Remaining builtin constants, variables, interfaces, and functions.
-	trimmed := item.Label
-	if i := strings.Index(trimmed, "("); i >= 0 {
-		trimmed = trimmed[:i]
-	}
-	switch trimmed {
-	case "append", "cap", "close", "complex", "copy", "delete",
-		"error", "false", "imag", "iota", "len", "make", "new",
-		"nil", "panic", "print", "println", "real", "recover", "true":
-		return true
-	}
-	return false
-}
-
-// diffCompletionItems prints the diff between expected and actual completion
-// test results.
-func diffCompletionItems(want []source.CompletionItem, got []protocol.CompletionItem) string {
-	if len(got) != len(want) {
-		return summarizeCompletionItems(-1, want, got, "different lengths got %v want %v", len(got), len(want))
-	}
-	for i, w := range want {
-		g := got[i]
-		if w.Label != g.Label {
-			return summarizeCompletionItems(i, want, got, "incorrect Label got %v want %v", g.Label, w.Label)
-		}
-		if w.Detail != g.Detail {
-			return summarizeCompletionItems(i, want, got, "incorrect Detail got %v want %v", g.Detail, w.Detail)
-		}
-		if w.Documentation != "" && !strings.HasPrefix(w.Documentation, "@") {
-			if w.Documentation != g.Documentation {
-				return summarizeCompletionItems(i, want, got, "incorrect Documentation got %v want %v", g.Documentation, w.Documentation)
-			}
-		}
-		if wkind := toProtocolCompletionItemKind(w.Kind); wkind != g.Kind {
-			return summarizeCompletionItems(i, want, got, "incorrect Kind got %v want %v", g.Kind, wkind)
-		}
-	}
-	return ""
-}
-
-func checkCompletionOrder(want []source.CompletionItem, got []protocol.CompletionItem) string {
-	var (
-		matchedIdxs []int
-		lastGotIdx  int
-		inOrder     = true
-	)
-	for _, w := range want {
-		var found bool
-		for i, g := range got {
-			if w.Label == g.Label && w.Detail == g.Detail && toProtocolCompletionItemKind(w.Kind) == g.Kind {
-				matchedIdxs = append(matchedIdxs, i)
-				found = true
-				if i < lastGotIdx {
-					inOrder = false
-				}
-				lastGotIdx = i
-				break
-			}
-		}
-		if !found {
-			return summarizeCompletionItems(-1, []source.CompletionItem{w}, got, "didn't find expected completion")
-		}
-	}
-
-	sort.Ints(matchedIdxs)
-	matched := make([]protocol.CompletionItem, 0, len(matchedIdxs))
-	for _, idx := range matchedIdxs {
-		matched = append(matched, got[idx])
-	}
-
-	if !inOrder {
-		return summarizeCompletionItems(-1, want, matched, "completions out of order")
-	}
-
-	return ""
-}
-
-func summarizeCompletionItems(i int, want []source.CompletionItem, got []protocol.CompletionItem, reason string, args ...interface{}) string {
-	msg := &bytes.Buffer{}
-	fmt.Fprint(msg, "completion failed")
-	if i >= 0 {
-		fmt.Fprintf(msg, " at %d", i)
-	}
-	fmt.Fprint(msg, " because of ")
-	fmt.Fprintf(msg, reason, args...)
-	fmt.Fprint(msg, ":\nexpected:\n")
-	for _, d := range want {
-		fmt.Fprintf(msg, "  %v\n", d)
-	}
-	fmt.Fprintf(msg, "got:\n")
-	for _, d := range got {
-		fmt.Fprintf(msg, "  %v\n", d)
-	}
-	return msg.String()
 }
 
 func (r *runner) FoldingRange(t *testing.T, data tests.FoldingRanges) {
@@ -352,7 +138,7 @@ func (r *runner) FoldingRange(t *testing.T, data tests.FoldingRanges) {
 }
 
 func (r *runner) foldingRanges(t *testing.T, prefix string, uri span.URI, ranges []protocol.FoldingRange) {
-	m, err := r.mapper(uri)
+	m, err := r.data.Mapper(uri)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +270,7 @@ func (r *runner) Format(t *testing.T, data tests.Formats) {
 			}
 			continue
 		}
-		m, err := r.mapper(uri)
+		m, err := r.data.Mapper(uri)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -520,7 +306,7 @@ func (r *runner) Import(t *testing.T, data tests.Imports) {
 			}
 			continue
 		}
-		m, err := r.mapper(uri)
+		m, err := r.data.Mapper(uri)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -545,34 +331,29 @@ func (r *runner) SuggestedFix(t *testing.T, data tests.SuggestedFixes) {
 	for _, spn := range data {
 		uri := spn.URI()
 		filename := uri.Filename()
-		v := r.server.session.ViewOf(uri)
-		fixed := string(r.data.Golden("suggestedfix", filename, func() ([]byte, error) {
-			cmd := exec.Command("suggestedfix", filename) // TODO(matloob): what do we do here?
-			out, _ := cmd.Output()                        // ignore error, sometimes we have intentionally ungofmt-able files
-			return out, nil
-		}))
-		f, err := getGoFile(r.ctx, v, uri)
+		view := r.server.session.ViewOf(uri)
+		f, err := getGoFile(r.ctx, view, uri)
 		if err != nil {
 			t.Fatal(err)
 		}
-		results, err := source.Diagnostics(r.ctx, v, f, nil)
+		diagnostics, _, err := source.Diagnostics(r.ctx, view, f, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = results
 		actions, err := r.server.CodeAction(r.ctx, &protocol.CodeActionParams{
 			TextDocument: protocol.TextDocumentIdentifier{
 				URI: protocol.NewURI(uri),
 			},
-			Context: protocol.CodeActionContext{Only: []protocol.CodeActionKind{protocol.QuickFix}},
+			Context: protocol.CodeActionContext{
+				Only:        []protocol.CodeActionKind{protocol.QuickFix},
+				Diagnostics: toProtocolDiagnostics(r.ctx, diagnostics[uri]),
+			},
 		})
 		if err != nil {
-			if fixed != "" {
-				t.Error(err)
-			}
+			t.Error(err)
 			continue
 		}
-		m, err := r.mapper(f.URI())
+		m, err := r.data.Mapper(f.URI())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -587,6 +368,9 @@ func (r *runner) SuggestedFix(t *testing.T, data tests.SuggestedFixes) {
 			t.Error(err)
 		}
 		got := diff.ApplyEdits(string(m.Content), sedits)
+		fixed := string(r.data.Golden("suggestedfix", filename, func() ([]byte, error) {
+			return []byte(got), nil
+		}))
 		if fixed != got {
 			t.Errorf("suggested fixes failed for %s, expected:\n%v\ngot:\n%v", filename, fixed, got)
 		}
@@ -595,7 +379,7 @@ func (r *runner) SuggestedFix(t *testing.T, data tests.SuggestedFixes) {
 
 func (r *runner) Definition(t *testing.T, data tests.Definitions) {
 	for _, d := range data {
-		sm, err := r.mapper(d.Src.URI())
+		sm, err := r.data.Mapper(d.Src.URI())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -611,24 +395,19 @@ func (r *runner) Definition(t *testing.T, data tests.Definitions) {
 		var hover *protocol.Hover
 		if d.IsType {
 			params := &protocol.TypeDefinitionParams{
-				tdpp,
-				protocol.WorkDoneProgressParams{},
-				protocol.PartialResultParams{},
+				TextDocumentPositionParams: tdpp,
 			}
 			locs, err = r.server.TypeDefinition(r.ctx, params)
 		} else {
 			params := &protocol.DefinitionParams{
-				tdpp,
-				protocol.WorkDoneProgressParams{},
-				protocol.PartialResultParams{},
+				TextDocumentPositionParams: tdpp,
 			}
 			locs, err = r.server.Definition(r.ctx, params)
 			if err != nil {
 				t.Fatalf("failed for %v: %+v", d.Src, err)
 			}
 			v := &protocol.HoverParams{
-				tdpp,
-				protocol.WorkDoneProgressParams{},
+				TextDocumentPositionParams: tdpp,
 			}
 			hover, err = r.server.Hover(r.ctx, v)
 		}
@@ -648,7 +427,7 @@ func (r *runner) Definition(t *testing.T, data tests.Definitions) {
 			}
 		} else if !d.OnlyHover {
 			locURI := span.NewURI(locs[0].URI)
-			lm, err := r.mapper(locURI)
+			lm, err := r.data.Mapper(locURI)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -665,7 +444,7 @@ func (r *runner) Definition(t *testing.T, data tests.Definitions) {
 
 func (r *runner) Highlight(t *testing.T, data tests.Highlights) {
 	for name, locations := range data {
-		m, err := r.mapper(locations[0].URI())
+		m, err := r.data.Mapper(locations[0].URI())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -678,9 +457,7 @@ func (r *runner) Highlight(t *testing.T, data tests.Highlights) {
 			Position:     loc.Range.Start,
 		}
 		params := &protocol.DocumentHighlightParams{
-			tdpp,
-			protocol.WorkDoneProgressParams{},
-			protocol.PartialResultParams{},
+			TextDocumentPositionParams: tdpp,
 		}
 		highlights, err := r.server.DocumentHighlight(r.ctx, params)
 		if err != nil {
@@ -701,7 +478,7 @@ func (r *runner) Highlight(t *testing.T, data tests.Highlights) {
 
 func (r *runner) Reference(t *testing.T, data tests.References) {
 	for src, itemList := range data {
-		sm, err := r.mapper(src.URI())
+		sm, err := r.data.Mapper(src.URI())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -712,7 +489,7 @@ func (r *runner) Reference(t *testing.T, data tests.References) {
 
 		want := make(map[protocol.Location]bool)
 		for _, pos := range itemList {
-			m, err := r.mapper(pos.URI())
+			m, err := r.data.Mapper(pos.URI())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -749,7 +526,7 @@ func (r *runner) Rename(t *testing.T, data tests.Renames) {
 
 		uri := spn.URI()
 		filename := uri.Filename()
-		sm, err := r.mapper(uri)
+		sm, err := r.data.Mapper(uri)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -777,7 +554,7 @@ func (r *runner) Rename(t *testing.T, data tests.Renames) {
 
 		var res []string
 		for uri, edits := range *workspaceEdits.Changes {
-			m, err := r.mapper(span.URI(uri))
+			m, err := r.data.Mapper(span.URI(uri))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -787,7 +564,10 @@ func (r *runner) Rename(t *testing.T, data tests.Renames) {
 			}
 			filename := filepath.Base(m.URI.Filename())
 			contents := applyEdits(string(m.Content), sedits)
-			res = append(res, fmt.Sprintf("%s:\n%s", filename, contents))
+			if len(*workspaceEdits.Changes) > 1 {
+				contents = fmt.Sprintf("%s:\n%s", filename, contents)
+			}
+			res = append(res, contents)
 		}
 
 		// Sort on filename
@@ -813,7 +593,7 @@ func (r *runner) Rename(t *testing.T, data tests.Renames) {
 
 func (r *runner) PrepareRename(t *testing.T, data tests.PrepareRenames) {
 	for src, want := range data {
-		m, err := r.mapper(src.URI())
+		m, err := r.data.Mapper(src.URI())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -826,8 +606,7 @@ func (r *runner) PrepareRename(t *testing.T, data tests.PrepareRenames) {
 			Position:     loc.Range.Start,
 		}
 		params := &protocol.PrepareRenameParams{
-			tdpp,
-			protocol.WorkDoneProgressParams{},
+			TextDocumentPositionParams: tdpp,
 		}
 		got, err := r.server.PrepareRename(context.Background(), params)
 		if err != nil {
@@ -907,7 +686,7 @@ func (r *runner) diffSymbols(t *testing.T, uri span.URI, want []protocol.Documen
 	return ""
 }
 
-func summarizeSymbols(t *testing.T, i int, want []protocol.DocumentSymbol, got []protocol.DocumentSymbol, reason string, args ...interface{}) string {
+func summarizeSymbols(t *testing.T, i int, want, got []protocol.DocumentSymbol, reason string, args ...interface{}) string {
 	msg := &bytes.Buffer{}
 	fmt.Fprint(msg, "document symbols failed")
 	if i >= 0 {
@@ -928,7 +707,7 @@ func summarizeSymbols(t *testing.T, i int, want []protocol.DocumentSymbol, got [
 
 func (r *runner) SignatureHelp(t *testing.T, data tests.Signatures) {
 	for spn, expectedSignatures := range data {
-		m, err := r.mapper(spn.URI())
+		m, err := r.data.Mapper(spn.URI())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -943,8 +722,7 @@ func (r *runner) SignatureHelp(t *testing.T, data tests.Signatures) {
 			Position: loc.Range.Start,
 		}
 		params := &protocol.SignatureHelpParams{
-			tdpp,
-			protocol.WorkDoneProgressParams{},
+			TextDocumentPositionParams: tdpp,
 		}
 		gotSignatures, err := r.server.SignatureHelp(r.ctx, params)
 		if err != nil {
@@ -959,6 +737,9 @@ func (r *runner) SignatureHelp(t *testing.T, data tests.Signatures) {
 				t.Errorf("expected no signature, got %v", gotSignatures)
 			}
 			continue
+		}
+		if gotSignatures == nil {
+			t.Fatalf("expected %v, got nil", expectedSignatures)
 		}
 		if diff := diffSignatures(spn, expectedSignatures, gotSignatures); diff != "" {
 			t.Error(diff)
@@ -1003,7 +784,7 @@ func diffSignatures(spn span.Span, want *source.SignatureInformation, got *proto
 
 func (r *runner) Link(t *testing.T, data tests.Links) {
 	for uri, wantLinks := range data {
-		m, err := r.mapper(uri)
+		m, err := r.data.Mapper(uri)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1054,27 +835,6 @@ func (r *runner) Link(t *testing.T, data tests.Links) {
 	}
 }
 
-func (r *runner) mapper(uri span.URI) (*protocol.ColumnMapper, error) {
-	filename := uri.Filename()
-	fset := r.data.Exported.ExpectFileSet
-	var f *token.File
-	fset.Iterate(func(check *token.File) bool {
-		if check.Name() == filename {
-			f = check
-			return false
-		}
-		return true
-	})
-	if f == nil {
-		return nil, fmt.Errorf("no token.File for %s", uri)
-	}
-	content, err := r.data.Exported.FileContents(f.Name())
-	if err != nil {
-		return nil, err
-	}
-	return protocol.NewColumnMapper(uri, filename, fset, f, content), nil
-}
-
 func TestBytesOffset(t *testing.T) {
 	tests := []struct {
 		text string
@@ -1102,7 +862,13 @@ func TestBytesOffset(t *testing.T) {
 		fset := token.NewFileSet()
 		f := fset.AddFile(fname, -1, len(test.text))
 		f.SetLinesForContent([]byte(test.text))
-		mapper := protocol.NewColumnMapper(span.FileURI(fname), fname, fset, f, []byte(test.text))
+		uri := span.FileURI(fname)
+		converter := span.NewContentConverter(fname, []byte(test.text))
+		mapper := &protocol.ColumnMapper{
+			URI:       uri,
+			Converter: converter,
+			Content:   []byte(test.text),
+		}
 		got, err := mapper.Point(test.pos)
 		if err != nil && test.want != -1 {
 			t.Errorf("unexpected error: %v", err)

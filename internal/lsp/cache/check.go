@@ -62,6 +62,19 @@ type checkPackageHandle struct {
 	config *packages.Config
 }
 
+func (cph *checkPackageHandle) mode() source.ParseMode {
+	if len(cph.files) == 0 {
+		return -1
+	}
+	mode := cph.files[0].Mode()
+	for _, ph := range cph.files[1:] {
+		if ph.Mode() != mode {
+			return -1
+		}
+	}
+	return mode
+}
+
 // checkPackageData contains the data produced by type-checking a package.
 type checkPackageData struct {
 	memoize.NoCopy
@@ -85,18 +98,13 @@ func (imp *importer) checkPackageHandle(ctx context.Context, m *metadata) (*chec
 		log.Error(ctx, "no ParseGoHandles", err, telemetry.Package.Of(m.id))
 		return nil, err
 	}
-	key := checkPackageKey{
-		id:     string(m.id),
-		files:  hashParseKeys(phs),
-		config: hashConfig(imp.config),
-	}
 	cph := &checkPackageHandle{
 		m:       m,
 		files:   phs,
 		config:  imp.config,
 		imports: make(map[packagePath]*checkPackageHandle),
 	}
-	h := imp.view.session.cache.store.Bind(key, func(ctx context.Context) interface{} {
+	h := imp.view.session.cache.store.Bind(cph.key(), func(ctx context.Context) interface{} {
 		data := &checkPackageData{}
 		data.pkg, data.err = imp.typeCheck(ctx, cph, m)
 		return data
@@ -150,13 +158,33 @@ func (cph *checkPackageHandle) ID() string {
 	return string(cph.m.id)
 }
 
+func (cph *checkPackageHandle) MissingDependencies() []string {
+	var md []string
+	for i := range cph.m.missingDeps {
+		md = append(md, string(i))
+	}
+	return md
+}
+
 func (cph *checkPackageHandle) Cached(ctx context.Context) (source.Package, error) {
+	return cph.cached(ctx)
+}
+
+func (cph *checkPackageHandle) cached(ctx context.Context) (*pkg, error) {
 	v := cph.handle.Cached()
 	if v == nil {
-		return nil, errors.Errorf("no cached value for %s", cph.m.pkgPath)
+		return nil, errors.Errorf("no cached type information for %s", cph.m.pkgPath)
 	}
 	data := v.(*checkPackageData)
 	return data.pkg, data.err
+}
+
+func (cph *checkPackageHandle) key() checkPackageKey {
+	return checkPackageKey{
+		id:     string(cph.m.id),
+		files:  hashParseKeys(cph.files),
+		config: hashConfig(cph.config),
+	}
 }
 
 func (imp *importer) parseGoHandles(ctx context.Context, m *metadata) ([]source.ParseGoHandle, error) {
@@ -169,13 +197,6 @@ func (imp *importer) parseGoHandles(ctx context.Context, m *metadata) ([]source.
 		fh := f.Handle(ctx)
 		mode := source.ParseExported
 		if imp.topLevelPackageID == m.id {
-			mode = source.ParseFull
-		}
-		// If we have the full AST cached, don't bother getting the trimmed version.
-		if imp.view.session.cache.store.Cached(parseKey{
-			file: fh.Identity(),
-			mode: source.ParseFull,
-		}) != nil {
 			mode = source.ParseFull
 		}
 		phs = append(phs, imp.view.session.cache.ParseGoHandle(fh, mode))
@@ -192,23 +213,21 @@ func (imp *importer) Import(pkgPath string) (*types.Package, error) {
 		return nil, errors.Errorf("no parent package for import %s", pkgPath)
 	}
 
-	// Get the package metadata from the importing package.
+	// Get the CheckPackageHandle from the importing package.
 	cph, ok := imp.parentCheckPackageHandle.imports[packagePath(pkgPath)]
 	if !ok {
 		return nil, errors.Errorf("no package data for import path %s", pkgPath)
 	}
-
-	// Create a check package handle to get the type information for this package.
+	for _, ph := range cph.Files() {
+		if ph.Mode() != source.ParseExported {
+			panic("dependency parsed in full mode")
+		}
+	}
 	pkg, err := cph.check(ctx)
 	if err != nil {
 		return nil, err
 	}
 	imp.parentPkg.imports[packagePath(pkgPath)] = pkg
-
-	// Add every file in this package to our cache.
-	if err := imp.cachePackage(ctx, cph); err != nil {
-		return nil, err
-	}
 	return pkg.GetTypes(), nil
 }
 
@@ -258,15 +277,12 @@ func (imp *importer) typeCheck(ctx context.Context, cph *checkPackageHandle, m *
 		go func(i int, ph source.ParseGoHandle) {
 			defer wg.Done()
 
-			files[i], parseErrors[i] = ph.Parse(ctx)
+			files[i], _, parseErrors[i], _ = ph.Parse(ctx)
 		}(i, ph)
 	}
 	wg.Wait()
 
 	for _, err := range parseErrors {
-		if err == context.Canceled {
-			return nil, errors.Errorf("parsing files for %s: %v", m.pkgPath, err)
-		}
 		if err != nil {
 			imp.view.session.cache.appendPkgError(pkg, err)
 		}
@@ -320,42 +336,6 @@ func (imp *importer) child(ctx context.Context, pkg *pkg, cph *checkPackageHandl
 		parentPkg:                pkg,
 		parentCheckPackageHandle: cph,
 	}
-}
-
-func (imp *importer) cachePackage(ctx context.Context, cph *checkPackageHandle) error {
-	for _, ph := range cph.files {
-		uri := ph.File().Identity().URI
-		f, err := imp.view.GetFile(ctx, uri)
-		if err != nil {
-			return errors.Errorf("no such file %s: %v", uri, err)
-		}
-		gof, ok := f.(*goFile)
-		if !ok {
-			return errors.Errorf("%s is not a Go file", uri)
-		}
-		if err := imp.cachePerFile(ctx, gof, ph, cph); err != nil {
-			return errors.Errorf("failed to cache file %s: %v", gof.URI(), err)
-		}
-	}
-	return nil
-}
-
-func (imp *importer) cachePerFile(ctx context.Context, gof *goFile, ph source.ParseGoHandle, cph *checkPackageHandle) error {
-	gof.mu.Lock()
-	defer gof.mu.Unlock()
-
-	// Set the package even if we failed to parse the file.
-	if gof.pkgs == nil {
-		gof.pkgs = make(map[packageID]source.CheckPackageHandle)
-	}
-	gof.pkgs[cph.m.id] = cph
-
-	file, err := ph.Parse(ctx)
-	if file == nil {
-		return errors.Errorf("no AST for %s: %v", ph.File().Identity().URI, err)
-	}
-	gof.imports = file.Imports
-	return nil
 }
 
 func (c *cache) appendPkgError(pkg *pkg, err error) {

@@ -18,6 +18,7 @@ import (
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/telemetry/log"
 	"golang.org/x/tools/internal/telemetry/tag"
+	errors "golang.org/x/xerrors"
 )
 
 // formatCompletion creates a completion item for a given candidate.
@@ -33,7 +34,7 @@ func (c *completer) item(cand candidate) (CompletionItem, error) {
 		label         = cand.name
 		detail        = types.TypeString(obj.Type(), c.qf)
 		insert        = label
-		kind          CompletionItemKind
+		kind          = protocol.TextCompletion
 		snip          *snippet.Builder
 		protocolEdits []protocol.TextEdit
 	)
@@ -51,18 +52,16 @@ func (c *completer) item(cand candidate) (CompletionItem, error) {
 	case *types.TypeName:
 		detail, kind = formatType(obj.Type(), c.qf)
 	case *types.Const:
-		kind = ConstantCompletionItem
+		kind = protocol.ConstantCompletion
 	case *types.Var:
 		if _, ok := obj.Type().(*types.Struct); ok {
 			detail = "struct{...}" // for anonymous structs
 		}
 		if obj.IsField() {
-			kind = FieldCompletionItem
+			kind = protocol.FieldCompletion
 			snip = c.structFieldSnippet(label, detail)
-		} else if c.isParameter(obj) {
-			kind = ParameterCompletionItem
 		} else {
-			kind = VariableCompletionItem
+			kind = protocol.VariableCompletion
 		}
 
 		if sig, ok := obj.Type().Underlying().(*types.Signature); ok && cand.expandFuncCall {
@@ -73,16 +72,16 @@ func (c *completer) item(cand candidate) (CompletionItem, error) {
 		if !ok {
 			break
 		}
-		kind = FunctionCompletionItem
+		kind = protocol.FunctionCompletion
 		if sig != nil && sig.Recv() != nil {
-			kind = MethodCompletionItem
+			kind = protocol.MethodCompletion
 		}
 
 		if cand.expandFuncCall {
 			expandFuncCall(sig)
 		}
 	case *types.PkgName:
-		kind = PackageCompletionItem
+		kind = protocol.ModuleCompletion
 		detail = fmt.Sprintf("%q", obj.Imported().Path())
 	}
 
@@ -122,13 +121,19 @@ func (c *completer) item(cand candidate) (CompletionItem, error) {
 	if !pos.IsValid() {
 		return item, nil
 	}
-
 	uri := span.FileURI(pos.Filename)
-	_, file, pkg, err := c.pkg.FindFile(c.ctx, uri, obj.Pos())
+	ph, pkg, err := c.pkg.FindFile(c.ctx, uri)
 	if err != nil {
 		return CompletionItem{}, err
 	}
-	ident, err := findIdentifier(c.ctx, c.view, []Package{pkg}, file, obj.Pos())
+	file, _, _, err := ph.Cached(c.ctx)
+	if err != nil {
+		return CompletionItem{}, err
+	}
+	if !(file.Pos() <= obj.Pos() && obj.Pos() <= file.End()) {
+		return CompletionItem{}, errors.Errorf("no file for %s", obj.Name())
+	}
+	ident, err := findIdentifier(c.ctx, c.view, pkg, file, obj.Pos())
 	if err != nil {
 		return CompletionItem{}, err
 	}
@@ -143,20 +148,6 @@ func (c *completer) item(cand candidate) (CompletionItem, error) {
 	return item, nil
 }
 
-// isParameter returns true if the given *types.Var is a parameter
-// of the enclosingFunction.
-func (c *completer) isParameter(v *types.Var) bool {
-	if c.enclosingFunction == nil {
-		return false
-	}
-	for i := 0; i < c.enclosingFunction.Params().Len(); i++ {
-		if c.enclosingFunction.Params().At(i) == v {
-			return true
-		}
-	}
-	return false
-}
-
 func (c *completer) formatBuiltin(cand candidate) CompletionItem {
 	obj := cand.obj
 	item := CompletionItem{
@@ -166,10 +157,14 @@ func (c *completer) formatBuiltin(cand candidate) CompletionItem {
 	}
 	switch obj.(type) {
 	case *types.Const:
-		item.Kind = ConstantCompletionItem
+		item.Kind = protocol.ConstantCompletion
 	case *types.Builtin:
-		item.Kind = FunctionCompletionItem
-		decl, ok := lookupBuiltinDecl(c.view, obj.Name()).(*ast.FuncDecl)
+		item.Kind = protocol.FunctionCompletion
+		builtin := c.view.BuiltinPackage().Lookup(obj.Name())
+		if obj == nil {
+			break
+		}
+		decl, ok := builtin.Decl.(*ast.FuncDecl)
 		if !ok {
 			break
 		}
@@ -180,12 +175,12 @@ func (c *completer) formatBuiltin(cand candidate) CompletionItem {
 		item.snippet = c.functionCallSnippet(obj.Name(), params)
 	case *types.TypeName:
 		if types.IsInterface(obj.Type()) {
-			item.Kind = InterfaceCompletionItem
+			item.Kind = protocol.InterfaceCompletion
 		} else {
-			item.Kind = TypeCompletionItem
+			item.Kind = protocol.ClassCompletion
 		}
 	case *types.Nil:
-		item.Kind = VariableCompletionItem
+		item.Kind = protocol.VariableCompletion
 	}
 	return item
 }
